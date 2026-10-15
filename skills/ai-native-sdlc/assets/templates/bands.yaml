@@ -1,0 +1,72 @@
+# bands.yaml - control band for ONE metric (the playbook's Stage 6 example, extended).
+# Detector: python3 <skill-dir>/scripts/bands.py check --config bands.yaml --series series.json
+# Response: python3 <skill-dir>/scripts/bands.py respond --config bands.yaml --series series.json --repo . --dry-run
+# Required keys: metric, baseline, rules, tiers. Everything else has the default shown.
+# Tune by reviewed PR: a dismissed finding should change a line here, with the reason in the commit.
+
+metric: ci_test_failure_rate
+# Passed to the diagnosing model as context. Say where the data comes from and what is normal.
+description: "Daily share of failed CI runs on the default branch (GitHub Actions workflow CI)."
+
+# rolling_<N>d = points within N days before the evaluation window (needs ts in the series);
+# rolling_<N>  = the last N points before the evaluation window.
+# 30 days: long enough for ~20+ daily points, short enough to follow a legitimate new normal.
+baseline: rolling_30d
+
+# western_electric = WE1-WE4, nelson = N1-N8, or a list such as [WE1, WE2, WE4].
+# Western Electric is the playbook's choice; it catches slow drift (WE3, WE4) as well as spikes.
+rules: western_electric
+
+# Optional per-rule tier override; defaults: WE1/N1 -> 3sigma, WE2/N5 -> 2sigma, others -> 1sigma.
+# Example: when slow drift matters (the playbook's PR cycle time report), make WE4 diagnose:
+# rule_tiers: { WE4: 2sigma }
+
+# moving_range = MR-bar / 1.128 (individuals chart; robust for low-n operational metrics).
+# sample = standard deviation with ddof=1.
+sigma: moving_range
+
+# up | down | both. A failure rate going DOWN is good news: only a rise should act.
+# Side-less Nelson rules (N4, N7, N8) count only with both.
+direction: up
+
+# Fewer baseline points -> tier none with a reason. 20 is the usual minimum for trial control
+# limits; below it the sigma estimate is too noisy for a 3-sigma line to mean 3 sigma.
+min_points: 20
+
+# Newest points scanned by the rules and excluded from the baseline, so a drift cannot drag
+# the baseline along with it. Must be >= the longest selected rule: 8 (WE4), 15 (Nelson N7).
+eval_window: 8
+
+# Lower bound on sigma. A rate that sits at 0% has sigma 0, and a single failure would be an
+# infinite z. 0.005 = half a percentage point. 0 means no floor (a flat baseline -> tier none).
+sigma_floor: 0.005
+
+# Points inside these ranges are dropped (known deploy windows, holidays, incidents already
+# handled). If the NEWEST point is inside a range, nothing is evaluated this run.
+# Quote timestamps. ISO 8601, UTC.
+exclusions:
+  - { from: "2026-12-24T00:00:00Z", to: "2027-01-02T00:00:00Z" }
+
+# Dollar cap on each claude -p diagnosis (--max-budget-usd). A run that hits it fails and
+# writes no intent; raise it only if diagnoses keep ending error_max_budget_usd.
+diagnose_max_budget_usd: 1.0
+
+# Response tiers (playbook): 1sigma log only; 2sigma read-only diagnosis; 3sigma act only by a
+# PR into the review gate or a pre-approved runbook. Highest tier hit wins.
+# tools: a GRANT for the read-only diagnosis (passed as --allowedTools). Restriction comes from
+#   --tools "Read,Grep,Glob,Bash" plus --permission-mode dontAsk; reads outside the repo are
+#   blocked. Read, Grep, Glob are always granted. Refused: bare Bash, Bash(*), Edit/Write,
+#   wildcard or shell/interpreter commands (Bash(sh -c *), Bash(python3 *)) and write commands
+#   (git push/commit/reset, gh pr merge, gh release, gh workflow run, Bash(git *)); reviewing
+#   this file is the control for the rest. A 3sigma tier without tools reuses the 2sigma tools.
+# routes (propose only): pull_request = commit the intent on change/<id> and open a PR;
+#   runbook:<name> = run runbooks.<name> from .claude/sdlc.json. Names not listed there are
+#   refused. Routes run only with --execute-routes. Quote "runbook:..." (it contains a colon).
+# mcp_config (optional, diagnose/propose): path to an MCP config for read-only metric tools.
+#   Without it the diagnosis runs with --strict-mcp-config and no MCP servers.
+tiers:
+  1sigma: { action: log }
+  2sigma: { action: diagnose,
+            tools: "Read,Grep,Bash(gh run view *)" }
+  3sigma: { action: propose,
+            routes: [pull_request, "runbook:rollback-deploy"] }

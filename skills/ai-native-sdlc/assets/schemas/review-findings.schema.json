@@ -1,0 +1,93 @@
+{
+  "title": "SDLC review findings (one pass)",
+  "description": "Output of one review pass (Bugs, Security or Compliance) by the sdlc-reviewer subagent or a headless claude -p review step. Only findings with confidence >= 80 are reported; the rest are counted in dropped_low_confidence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pass", "findings", "summary"],
+  "properties": {
+    "pass": {
+      "type": "string",
+      "enum": ["Bugs", "Security", "Compliance"],
+      "description": "The single REVIEW.md pass this output covers."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Reported findings, most severe first. Empty when nothing survived verification.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "line", "title", "failure_scenario", "evidence", "confidence"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["Important", "Nit", "Pre-existing"],
+            "description": "As defined in REVIEW.md 'What Important means here'. Pre-existing = a real bug this diff did not introduce."
+          },
+          "file": {
+            "type": "string",
+            "description": "Repo-relative POSIX path."
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-indexed line in the post-change file (pre-change file for deletions)."
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "title": {
+            "type": "string",
+            "description": "The defect in one short sentence."
+          },
+          "failure_scenario": {
+            "type": "string",
+            "description": "Concrete input or state, and the wrong output, crash, leak or policy breach that follows."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "The code trace that proves it: the call path and the lines read (file:line), not a restatement of the title."
+          },
+          "confidence": {
+            "type": "integer",
+            "minimum": 80,
+            "maximum": 100,
+            "description": "Confidence the finding is real and in scope. Findings below 80 are not reported."
+          },
+          "reference": {
+            "type": "string",
+            "description": "For Compliance: the requirement or rule violated (FR-001, SC-002, plan.md section, REVIEW.md or CLAUDE.md rule). Empty string if none."
+          },
+          "suggested_fix": {
+            "type": "string",
+            "description": "Smallest change that removes the failure. Empty string if not obvious."
+          }
+        }
+      }
+    },
+    "nits_omitted": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Nits found beyond the REVIEW.md cap, counted but not listed."
+    },
+    "dropped_low_confidence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Candidate findings discarded because confidence was below 80 or the claim could not be verified in code."
+    },
+    "plan_claims_falsified": {
+      "type": "array",
+      "description": "Claims in plan.md or the PR description that the code contradicts (Compliance pass; may be empty for other passes).",
+      "items": { "type": "string" }
+    },
+    "not_reviewed": {
+      "type": "array",
+      "description": "Files or areas in the diff that were skipped and why (REVIEW.md 'Do not report', unreadable, denied).",
+      "items": { "type": "string" }
+    },
+    "summary": {
+      "type": "string",
+      "description": "Two or three sentences: what was reviewed, counts by severity, and the single most important finding."
+    }
+  }
+}

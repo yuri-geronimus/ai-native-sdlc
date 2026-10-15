@@ -1,0 +1,8 @@
+{
+  "name": "ai-native-sdlc",
+  "version": "0.1.0-alpha.1",
+  "description": "[Alpha] AI-native SDLC loop for regulated teams (fintech, payments, medtech): intent, spec, plan, build, verify, review, gated release and monitoring, with human approval gates, guard hooks and sdlc-* subagents.",
+  "author": {
+    "name": "Yuri Geronimus"
+  }
+}

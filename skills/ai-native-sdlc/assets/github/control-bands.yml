@@ -1,0 +1,615 @@
+# control-bands.yml - closes the loop: a control-band breach becomes a new intent.md.
+#
+# What it does (one job per privilege level)
+#   detect    no model, read-only. Fetches the metric series, runs
+#             `bands.py check --exit-code` (deterministic Western Electric / Nelson rules
+#             from bands.yaml), suppresses repeats (see "Repeat suppression"), and
+#             handles tier 1sigma (action "log") with `bands.py respond`.
+#   diagnose  2sigma/3sigma. `bands.py respond` runs a read-only `claude -p` (dontAsk,
+#             --tools limited, only the tier's read-only grants, no MCP unless the tier names
+#             a config, not --bare; exact flags: bands.py claude_command) and writes
+#             changes/<id>/intent.md from the structured output. Then the independent
+#             confidence gate (sdlc.py validate + the sdlc-gate prompt, reads
+#             outside the checkout and $BANDS_DIR blocked) returns continue/escalate. This
+#             job holds no write token and no production credential.
+#   triage    2sigma: files the intent as an issue labelled sdlc-triage. No model. The open
+#             sdlc-triage issues are the 2sigma half of the triage queue (the other half is
+#             changes/*/intent.md); the 2sigma tier never writes to the repo.
+#   propose   3sigma, route pull_request: commits the intent on branch change/<id> and opens
+#             a PR into the review gate, with a GitHub App token. No model in this job.
+#             Without the App configured it files a labelled issue instead. On that PR a
+#             maintainer may ask @claude (claude-mention.yml) for exactly the quarantine or
+#             revert the intent names.
+#   runbook   3sigma, route runbook:<name>: runs only commands pre-approved in
+#             .claude/sdlc.json "runbooks", and only when SDLC_EXECUTE_RUNBOOKS=true. Each
+#             execution is recorded as an open issue labelled sdlc-runbook; at most one per
+#             breach point, and none while an earlier record for the metric is open (a human
+#             reviews the automated action and closes the record to re-arm).
+#   Workflow runs, artifacts and bands-log.jsonl are the timestamped log of every breach,
+#   invocation and decision.
+#
+# Playbook play
+#   Stage 6 "Maintenance and closing the loop" (bands.yaml response tiers: 1sigma log,
+#   2sigma read-only diagnose, 3sigma act only via a PR into the review gate or a
+#   pre-approved runbook; the diagnosis is written as intent.md).
+#
+# Required secrets
+#   ANTHROPIC_API_KEY (diagnose job). SDLC_APP_PRIVATE_KEY plus repository variable
+#   SDLC_APP_ID (propose job): a GitHub App with contents and pull-requests write, used
+#   through actions/create-github-app-token. GITHUB_TOKEN cannot open PRs while "Allow
+#   GitHub Actions to create and approve pull requests" is off (governance.md keeps it off),
+#   and its PRs trigger no CI. No production credentials. A rollback
+#   runbook should dispatch the existing rollback pipeline, which holds its own credentials
+#   behind its own environment protection.
+#
+# Repository variables
+#   SDLC_BANDS_ENABLED=true             required; the workflow is inert until set
+#   SDLC_BANDS_CI_WORKFLOW              CI workflow name for the default series (default "CI")
+#   SDLC_EXECUTE_RUNBOOKS=true          allow the runbook job to run pre-approved runbooks
+#   SDLC_RUNBOOK_REQUIRE_DEPLOY_WITHIN_MIN  default 60 ("0" disables): run runbooks only if
+#                                       a deployment to SDLC_DEPLOY_ENVIRONMENT (default
+#                                       "production") happened within that many minutes
+#   SDLC_APP_ID                         App id for the propose job (see Required secrets)
+#
+# Repeat suppression (detect)
+#   Every issue and PR carries a marker "sdlc-band metric=<m> ts=<latest point> action=<a>".
+#   A breach is not re-diagnosed if an open labelled PR exists, if an open labelled issue
+#   covers the tier, or if any item (open, closed or merged) already carries the same
+#   metric+ts marker for the same or a higher action. So a dismissed or merged item does
+#   not re-fire on the same point; a breach lasting several days re-fires at most once per
+#   new point after its item closes. Tuning bands.yaml (Stage 6) makes dismissals stick.
+#   A failing gh lookup fails the run (it goes red) rather than guessing either way.
+#
+# How to adapt
+#   - Replace the "Fetch metric series" step (the one step to adapt in this file) with a
+#     deterministic query of your metrics store. The default computes the playbook's
+#     example metric, ci_test_failure_rate, from this repo's GitHub Actions history.
+#   - BANDS_CONFIG: path of bands.yaml (template: <skill>/assets/templates/bands.yaml).
+#     One metric per copy of this workflow (or turn detect..runbook into a matrix).
+#   - Cost: the gate run has --max-budget-usd; the diagnosis run's caps live in bands.py.
+#   - CLAUDE_CODE_VERSION is pinned; bump it in a PR after testing (>= 2.1.269).
+#   - Scheduled workflows run only from the default branch, may start late, and are
+#     disabled after 60 days without repository activity on public repos.
+
+name: Control bands
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the claude/route commands instead of running them"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: control-bands
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SKILL_DIR: .claude/skills/ai-native-sdlc
+  BANDS_CONFIG: bands.yaml
+  CLAUDE_CODE_VERSION: "2.1.294"  # pinned, tested; keep >= 2.1.269
+
+jobs:
+  detect:
+    if: vars.SDLC_BANDS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read          # checkout bands.yaml and the skill
+      actions: read           # default series: this repo's CI run history
+      issues: read            # dedupe: breach issues for this metric (any state)
+      pull-requests: read     # dedupe: breach PRs for this metric (any state)
+    outputs:
+      action: ${{ steps.check.outputs.action }}
+      tier: ${{ steps.check.outputs.tier }}
+      metric: ${{ steps.check.outputs.metric }}
+      label: ${{ steps.check.outputs.label }}
+      ts: ${{ steps.check.outputs.ts }}
+      suppressed: ${{ steps.dedupe.outputs.suppressed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Prepare
+        run: |
+          echo "BANDS_DIR=$RUNNER_TEMP/bands" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/bands"
+          test -f "$BANDS_CONFIG" || { echo "::error::$BANDS_CONFIG not found"; exit 1; }
+
+      - name: Fetch metric series
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOW: ${{ vars.SDLC_BANDS_CI_WORKFLOW || 'CI' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          MIN_RUNS_PER_DAY: "5"
+        run: |
+          # ADAPT: replace this step with a deterministic query of your metrics source
+          # (Prometheus, the CI system's API, a warehouse). Contract: write a JSON list of
+          # {"ts": "<ISO-8601 UTC>", "value": <number>} with the newest point last to
+          # $BANDS_DIR/series.json. Keep it deterministic: no model in detection.
+          #
+          # Default: ci_test_failure_rate = daily share of failed runs of $CI_WORKFLOW on the
+          # default branch. Days with fewer than MIN_RUNS_PER_DAY runs are dropped, because
+          # a rate over a tiny denominator has no meaningful sigma.
+          set -euo pipefail
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow "$CI_WORKFLOW" --branch "$DEFAULT_BRANCH" \
+            --status completed --limit 1000 --json conclusion,createdAt > "$BANDS_DIR/runs.json"
+          python3 - <<'PY'
+          import json, os
+          from collections import defaultdict
+          d = os.environ["BANDS_DIR"]
+          runs = json.load(open(os.path.join(d, "runs.json"), encoding="utf-8"))
+          days = defaultdict(lambda: [0, 0])  # day -> [failures, total]
+          for r in runs:
+              if r.get("conclusion") not in ("success", "failure"):
+                  continue  # cancelled/skipped runs say nothing about test health
+              day = r["createdAt"][:10]
+              days[day][1] += 1
+              days[day][0] += r["conclusion"] == "failure"
+          min_runs = int(os.environ.get("MIN_RUNS_PER_DAY", "5"))
+          series = [{"ts": day + "T00:00:00Z", "value": round(f / t, 4)}
+                    for day, (f, t) in sorted(days.items()) if t >= min_runs]
+          json.dump(series, open(os.path.join(d, "series.json"), "w", encoding="utf-8"))
+          print("%d daily points from %d runs" % (len(series), len(runs)))
+          PY
+
+      - name: Check bands (deterministic)
+        id: check
+        run: |
+          set +e
+          python3 "$SKILL_DIR/scripts/bands.py" check --config "$BANDS_CONFIG" \
+            --series "$BANDS_DIR/series.json" --exit-code > "$BANDS_DIR/check.json"
+          code=$?
+          set -e
+          cat "$BANDS_DIR/check.json"
+          case "$code" in 0|10|20|30) ;; *) echo "::error::bands.py check failed (exit $code)"; exit 1 ;; esac
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re
+          c = json.load(open(os.path.join(os.environ["BANDS_DIR"], "check.json"), encoding="utf-8"))
+          metric = str(c.get("metric", "metric"))
+          print("action=%s" % c.get("action", "none"))
+          print("tier=%s" % c.get("tier", "none"))
+          print("metric=%s" % metric)
+          print("label=%s" % ("sdlc-band:" + re.sub(r"[^A-Za-z0-9_.-]", "-", metric))[:50])
+          # Breach key: the newest point (timestamp, or point count for plain series).
+          ts = (c.get("latest") or {}).get("ts") or "n%s" % c.get("n")
+          print("ts=%s" % re.sub(r"[^A-Za-z0-9:.+-]", "-", str(ts)))
+          PY
+          {
+            echo "## Control band: $(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); print("%s tier=%s action=%s z=%s" % (c.get("metric"), c.get("tier"), c.get("action"), (c.get("latest") or {}).get("z")))' "$BANDS_DIR/check.json")"
+            echo '```json'; cat "$BANDS_DIR/check.json"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Suppress repeats (open items, or any item for the same breach point)
+        id: dedupe
+        if: steps.check.outputs.action == 'diagnose' || steps.check.outputs.action == 'propose'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTION: ${{ steps.check.outputs.action }}
+          LABEL: ${{ steps.check.outputs.label }}
+          METRIC: ${{ steps.check.outputs.metric }}
+          TS: ${{ steps.check.outputs.ts }}
+        run: |
+          set -euo pipefail
+          # No fallback on gh errors: the run goes red instead of guessing either way.
+          PRS=$(gh pr list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state all --limit 100 --json body,state) \
+            || { echo "::error::gh pr list failed; refusing to guess"; exit 1; }
+          ISSUES=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state all --limit 100 --json body,state) \
+            || { echo "::error::gh issue list failed; refusing to guess"; exit 1; }
+          PRS="$PRS" ISSUES="$ISSUES" python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime, json, os, re, sys
+          e = os.environ
+          act, rank = e["ACTION"], {"diagnose": 1, "propose": 2}
+          prs, issues = json.loads(e["PRS"] or "[]"), json.loads(e["ISSUES"] or "[]")
+          def marker(i):
+              m = re.search(r"sdlc-band metric=(\S+) ts=(\S+) action=(\w+)", i.get("body") or "")
+              return m.groups() if m else None
+          open_prs = sum(i.get("state") == "OPEN" for i in prs)
+          # An open issue covers its own action or lower: a diagnose issue does not stop a
+          # propose (escalation from 2sigma to 3sigma); a fallback propose issue does.
+          open_issues = sum(i.get("state") == "OPEN" and rank.get((marker(i) or ("", "", "diagnose"))[2], 1) >= rank[act]
+                            for i in issues)
+          same = sum(1 for i in prs + issues if marker(i) and marker(i)[:2] == (e["METRIC"], e["TS"])
+                     and rank.get(marker(i)[2], 0) >= rank[act])
+          sup = open_prs > 0 or open_issues > 0 or same > 0
+          print("suppressed=%s" % str(sup).lower())
+          if sup:
+              print("::notice::Breach %s ts=%s already handled (open PRs %d, open issues %d, same point %d); not re-diagnosing."
+                    % (e["LABEL"], e["TS"], open_prs, open_issues, same), file=sys.stderr)
+              with open(os.path.join(e["BANDS_DIR"], "bands-log.jsonl"), "a", encoding="utf-8") as fh:
+                  fh.write(json.dumps({"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "label": e["LABEL"],
+                                       "point": e["TS"], "action": act, "decision": "suppressed", "open_prs": open_prs,
+                                       "open_issues": open_issues, "same_point": same}) + "\n")
+          PY
+
+      - name: Log (1sigma)
+        if: steps.check.outputs.action == 'log'
+        run: |
+          python3 "$SKILL_DIR/scripts/bands.py" respond --config "$BANDS_CONFIG" \
+            --series "$BANDS_DIR/series.json" --repo . --log "$BANDS_DIR/bands-log.jsonl"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bands-detect
+          path: ${{ runner.temp }}/bands/
+          if-no-files-found: error
+          retention-days: 90
+
+  diagnose:
+    needs: detect
+    if: >-
+      (needs.detect.outputs.action == 'diagnose' || needs.detect.outputs.action == 'propose') &&
+      needs.detect.outputs.suppressed != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read          # checkout for the read-only diagnosis; this job pushes nothing
+      actions: read           # lets the tier's Bash(gh run view *) read CI runs and logs
+    outputs:
+      change_id: ${{ steps.respond.outputs.change_id }}
+      verdict: ${{ steps.gate.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0      # full history, in case the tier's tools grant Bash(git log *)
+          persist-credentials: false   # the model has Bash; keep the token out of .git/config
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bands-detect
+          path: ${{ runner.temp }}/bands
+
+      - name: Install Claude Code
+        run: |
+          echo "BANDS_DIR=$RUNNER_TEMP/bands" >> "$GITHUB_ENV"
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+
+      - name: Diagnose (read-only) and write intent.md
+        id: respond
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ github.token }}    # contents:read + actions:read only
+          SDLC_NONINTERACTIVE: "1"         # SKILL.md: bands.py sets it on claude too
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          cdir=$(python3 -c 'import json,os; p=".claude/sdlc.json"; c=json.load(open(p)) if os.path.exists(p) else {}; print(str(c.get("changes_dir","changes")).strip("/"))')
+          before=$(ls -1 "$cdir" 2>/dev/null | sort || true)
+          # No --execute-routes: routes run in the propose/runbook jobs, which hold the
+          # write permissions this job does not have.
+          python3 "$SKILL_DIR/scripts/bands.py" respond --config "$BANDS_CONFIG" \
+            --series "$BANDS_DIR/series.json" --repo . --log "$BANDS_DIR/bands-log.jsonl" $DRY_RUN \
+            | tee "$BANDS_DIR/respond.txt"
+          after=$(ls -1 "$cdir" 2>/dev/null | sort || true)
+          new=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") | sed '/^$/d' | head -n 1)
+          if [ -z "$new" ]; then
+            if [ -n "$DRY_RUN" ]; then echo "::notice::Dry run: no intent written."; exit 0; fi
+            echo "::error::bands.py respond created no change folder under $cdir/"; exit 1
+          fi
+          echo "change_id=$new" >> "$GITHUB_OUTPUT"
+          echo "CHANGES_DIR=$cdir" >> "$GITHUB_ENV"
+          mkdir -p "$BANDS_DIR/change"
+          cp -R "$cdir/$new" "$BANDS_DIR/change/"
+
+      - name: Confidence gate (deterministic validate + independent sdlc-gate)
+        id: gate
+        if: steps.respond.outputs.change_id != ''
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ID: ${{ steps.respond.outputs.change_id }}
+          SDLC_NONINTERACTIVE: "1"   # SKILL.md "Headless runs" (this run has no Bash; consistency)
+        run: |
+          set +e -uo pipefail   # no -e: collect every result, decide at the end
+          python3 "$SKILL_DIR/scripts/sdlc.py" validate "$ID" intent > "$BANDS_DIR/validate.txt" 2>&1
+          vcode=$?
+          agent=.claude/agents/sdlc-gate.md
+          [ -f "$agent" ] || agent="$SKILL_DIR/assets/agents/sdlc-gate.md"
+          # --agent works with -p, but sdlc-gate's tools allowlist (Read, Grep, Glob) hides the
+          # StructuredOutput tool, so --json-schema yields no structured_output (verified on
+          # 2.1.294); the agent body is therefore appended as a system prompt. No
+          # --allowedTools: dontAsk already allows reads in the checkout and --add-dir, and a
+          # bare "Read" grant would approve reads of any path on the runner. stdin is
+          # /dev/null: claude -p would otherwise wait on, and append, an open stdin.
+          claude -p "artifact: $CHANGES_DIR/$ID/intent.md
+          upstream: $BANDS_DIR/check.json (control-band breach evidence), $BANDS_DIR/series.json
+          validate output (sdlc.py validate, exit $vcode): $BANDS_DIR/validate.txt
+          Judge whether this incident intent faithfully and safely describes the breach and may enter the triage queue without a human now. Return the verdict." \
+            --permission-mode dontAsk --tools "Read,Grep,Glob" \
+            --settings '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}' \
+            --append-system-prompt-file "$agent" --add-dir "$BANDS_DIR" --strict-mcp-config \
+            --max-turns 15 --max-budget-usd 1 --output-format json \
+            --json-schema "$(cat "$SKILL_DIR/assets/schemas/gate-verdict.schema.json")" \
+            < /dev/null > "$BANDS_DIR/gate.json"
+          verdict=$(python3 - "$BANDS_DIR/gate.json" "$vcode" <<'PY'
+          import json, sys
+          try:
+              r = json.load(open(sys.argv[1], encoding="utf-8"))
+          except (OSError, ValueError):
+              print("escalate"); sys.exit(0)
+          ok = not r.get("is_error") and r.get("subtype") == "success"
+          v = (r.get("structured_output") or {}).get("verdict")
+          # Fail safe: any error, missing verdict or validation ERROR escalates.
+          print(v if ok and v in ("continue", "escalate") and sys.argv[2] == "0" else "escalate")
+          PY
+          )
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "Gate verdict: $verdict" | tee -a "$GITHUB_STEP_SUMMARY"
+          cp "$BANDS_DIR/gate.json" "$BANDS_DIR/validate.txt" "$BANDS_DIR/change/" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bands-diagnose
+          path: ${{ runner.temp }}/bands/
+          retention-days: 90
+
+  triage:
+    needs: [detect, diagnose]
+    if: >-
+      needs.detect.outputs.action == 'diagnose' &&
+      needs.diagnose.outputs.change_id != '' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write           # file the intent as a triage-queue issue and create its labels
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bands-diagnose
+          path: ${{ runner.temp }}/bands
+
+      - name: Open triage issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ID: ${{ needs.diagnose.outputs.change_id }}
+          VERDICT: ${{ needs.diagnose.outputs.verdict }}
+          LABEL: ${{ needs.detect.outputs.label }}
+          TIER: ${{ needs.detect.outputs.tier }}
+          METRIC: ${{ needs.detect.outputs.metric }}
+          TS: ${{ needs.detect.outputs.ts }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/bands"
+          title=$(sed -n 's/^title:[[:space:]]*//p' "$d/change/$ID/intent.md" | head -n 1 | tr -d '"')
+          {
+            echo "<!-- sdlc-band metric=$METRIC ts=$TS action=diagnose tier=$TIER change=$ID -->"
+            echo "**Control-band breach:** \`$METRIC\` at **$TIER**. Confidence gate: **$VERDICT**. Run: $RUN_URL"
+            echo
+            echo "Triage (service owner / on-call): **fix now**, **schedule**, or **dismiss with a reason** (dismissals tune bands.yaml). To take it into the repo, download artifact \`bands-diagnose\` from the run and commit \`intent.md\` and \`audit.md\` from its \`change/$ID/\` folder as \`changes/$ID/\`."
+            echo
+            echo "---"
+            cat "$d/change/$ID/intent.md"
+          } > body.md
+          labels="$LABEL,sdlc-triage"
+          [ "$VERDICT" = "continue" ] || labels="$labels,needs-human"
+          for l in $(echo "$labels" | tr ',' ' '); do
+            gh label create "$l" --repo "$GITHUB_REPOSITORY" --force >/dev/null 2>&1 || true
+          done
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "[$TIER] $METRIC: ${title:-$ID}" \
+            --body-file body.md --label "$labels"
+
+  propose:
+    needs: [detect, diagnose]
+    if: >-
+      needs.detect.outputs.action == 'propose' &&
+      needs.diagnose.outputs.change_id != '' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write         # push branch change/<id> with the intent; never the default branch
+      pull-requests: write    # open the intent PR into the review gate
+      issues: write           # create/apply breach labels; fallback issue when no App is set
+    steps:
+      # App token: GITHUB_TOKEN cannot open PRs with "Allow GitHub Actions to create and
+      # approve pull requests" off, and its PRs would trigger no CI.
+      - name: Mint GitHub App token
+        id: app-token
+        if: vars.SDLC_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.SDLC_APP_ID }}
+          private-key: ${{ secrets.SDLC_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bands-diagnose
+          path: ${{ runner.temp }}/bands
+
+      - name: Open intent PR (or a labelled issue when no App token)
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          HAVE_APP: ${{ steps.app-token.outputs.token != '' }}
+          ID: ${{ needs.diagnose.outputs.change_id }}
+          VERDICT: ${{ needs.diagnose.outputs.verdict }}
+          LABEL: ${{ needs.detect.outputs.label }}
+          TIER: ${{ needs.detect.outputs.tier }}
+          METRIC: ${{ needs.detect.outputs.metric }}
+          TS: ${{ needs.detect.outputs.ts }}
+          BASE: ${{ github.event.repository.default_branch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/bands"
+          cdir=$(python3 -c 'import json,os; p=".claude/sdlc.json"; c=json.load(open(p)) if os.path.exists(p) else {}; print(str(c.get("changes_dir","changes")).strip("/"))')
+          mkdir -p "$cdir/$ID"
+          # Only the change folder's artifacts; gate/validate output stays in the run artifact.
+          for f in intent.md audit.md; do if [ -f "$d/change/$ID/$f" ]; then cp "$d/change/$ID/$f" "$cdir/$ID/"; fi; done
+          title=$(sed -n 's/^title:[[:space:]]*//p' "$cdir/$ID/intent.md" | head -n 1 | tr -d '"')
+          labels="$LABEL,sdlc-triage"
+          [ "$VERDICT" = "continue" ] || labels="$labels,needs-human"
+          for l in $(echo "$labels" | tr ',' ' '); do
+            gh label create "$l" --repo "$GITHUB_REPOSITORY" --force >/dev/null 2>&1 || true
+          done
+          marker="<!-- sdlc-band metric=$METRIC ts=$TS action=propose tier=$TIER change=$ID -->"
+          if [ "$HAVE_APP" != "true" ]; then
+            echo "::warning::SDLC_APP_ID/SDLC_APP_PRIVATE_KEY not set; filing the 3sigma intent as an issue instead of a PR."
+            { echo "$marker"
+              echo "**Control-band breach:** \`$METRIC\` at **$TIER**. Confidence gate: **$VERDICT**. Run: $RUN_URL"
+              echo
+              echo "3sigma intent (no App token, so no PR). Commit \`intent.md\` and \`audit.md\` from artifact \`bands-diagnose\` (\`change/$ID/\`) as \`$cdir/$ID/\` in a PR; approving that PR is the intent gate."
+              echo; echo "---"; cat "$cdir/$ID/intent.md"; } > body.md
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "[$TIER] $METRIC: ${title:-$ID}" \
+              --body-file body.md --label "$labels"
+            exit 0
+          fi
+          # The id repeats for every run on the same day, so a branch may already exist
+          # (e.g. an earlier intent PR was closed): never push over it.
+          branch="change/$ID"
+          rc=0; git ls-remote --exit-code --heads origin "$branch" >/dev/null || rc=$?
+          case "$rc" in 0) branch="$branch-$GITHUB_RUN_ID" ;; 2) ;; *) echo "::error::git ls-remote failed ($rc)"; exit 1 ;; esac
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add "$cdir/$ID"
+          git commit -m "chore(sdlc): add incident intent $ID" -m "Written by control-bands from a $TIER breach of $METRIC. Run: $RUN_URL"
+          git push origin "$branch"
+          {
+            echo "$marker"
+            echo "Change: $ID"
+            echo
+            echo "**Control-band breach:** \`$METRIC\` at **$TIER**. Confidence gate: **$VERDICT**. Run: $RUN_URL"
+            echo
+            echo "This PR adds only the intent. Approving it is the intent gate; the fix follows Stages 2-5. Routes and the diagnosis evidence are in the run artifact \`bands-diagnose\`."
+            echo
+            echo "To add the quarantine or revert the intent names to this PR, comment \`@claude implement only the quarantine/revert named in $cdir/$ID/intent.md\`; branch protection and REVIEW.md decide the merge."
+          } > body.md
+          gh pr create --base "$BASE" --head "$branch" --title "[$TIER] $METRIC: ${title:-$ID}" \
+            --body-file body.md --label "$labels"
+
+  runbook:
+    needs: detect
+    # Runs alongside diagnose, not after it: a rollback should not wait for the diagnosis.
+    # The record issue below keeps it to one execution per breach and per open record.
+    if: >-
+      needs.detect.outputs.action == 'propose' && needs.detect.outputs.suppressed != 'true' &&
+      vars.SDLC_EXECUTE_RUNBOOKS == 'true' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Scope whatever the runbook needs (e.g. a token that may dispatch rollback.yml) to this
+    # environment; add required reviewers here if your policy wants a human on rollback.
+    environment: sdlc-runbooks
+    permissions:
+      contents: read          # read .claude/sdlc.json (the pre-approved runbooks)
+      actions: write          # only for runbooks that dispatch a workflow (gh workflow run); remove otherwise
+      deployments: read       # "deployment in the window" precondition and the record's deployment id
+      issues: write           # the sdlc-runbook record issue (idempotency and audit)
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bands-detect
+          path: ${{ runner.temp }}/bands
+
+      - name: Run pre-approved runbooks (once per breach, recorded)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WITHIN_MIN: ${{ vars.SDLC_RUNBOOK_REQUIRE_DEPLOY_WITHIN_MIN || '60' }}
+          DEPLOY_ENV: ${{ vars.SDLC_DEPLOY_ENVIRONMENT || 'production' }}
+          LABEL: ${{ needs.detect.outputs.label }}
+          TS: ${{ needs.detect.outputs.ts }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, re, subprocess, sys
+          utc, e = datetime.timezone.utc, os.environ
+          repo = e["GITHUB_REPOSITORY"]
+          def gh(*args):
+              # Fails closed: any gh error or unparsable output stops the job before acting.
+              out = subprocess.run(["gh"] + list(args), capture_output=True, text=True, timeout=60)
+              if out.returncode != 0:
+                  print("::error::gh %s failed: %s" % (args[0], out.stderr.strip()[:300])); sys.exit(1)
+              return out.stdout
+          def when(s):
+              return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=utc)
+          d = os.path.join(e["RUNNER_TEMP"], "bands")
+          check = json.load(open(os.path.join(d, "check.json"), encoding="utf-8"))
+          metric = str(check.get("metric"))
+          routes = (check.get("tier_config") or {}).get("routes") or []
+          cfg = json.load(open(".claude/sdlc.json", encoding="utf-8")) if os.path.exists(".claude/sdlc.json") else {}
+          runbooks = cfg.get("runbooks") or {}
+          names = [r.split(":", 1)[1] for r in routes if isinstance(r, str) and r.startswith("runbook:")]
+          if not names:
+              print("No runbook routes for this tier."); sys.exit(0)
+          # 1. Earlier executions for this metric (record issues, any state).
+          try:
+              recs = json.loads(gh("issue", "list", "--repo", repo, "--label", "sdlc-runbook", "--label", e["LABEL"],
+                                   "--state", "all", "--limit", "100", "--json", "number,state,body,createdAt"))
+          except ValueError:
+              print("::error::unparsable gh issue list output; runbooks not run."); sys.exit(1)
+          key = "sdlc-runbook metric=%s ts=%s" % (metric, e["TS"])
+          if any(key + " " in (r.get("body") or "") for r in recs):
+              print("::notice::Runbook already executed for this breach (%s); not run again." % key); sys.exit(0)
+          open_recs = [r for r in recs if r.get("state") == "OPEN"]
+          if open_recs:
+              print("::notice::Open runbook record #%s for %s: a human reviews and closes it before another automated run."
+                    % (open_recs[0]["number"], metric)); sys.exit(0)
+          # 2. Newest deployment: the window check, and never act twice on one deployment. A
+          #    deployment the rollback itself creates is covered by the open record above.
+          try:
+              deps = json.loads(gh("api", "repos/%s/deployments?environment=%s&per_page=1" % (repo, e["DEPLOY_ENV"])))
+          except ValueError:
+              print("::error::unparsable deployments output; runbooks not run."); sys.exit(1)
+          dep = deps[0] if deps else {}
+          dep_id = str(dep.get("id", "none"))
+          for r in recs:
+              m = re.search(r"deployment=(\S+)", r.get("body") or "")
+              if m and m.group(1) == dep_id:
+                  print("::notice::Deployment %s was already acted on (runbook record #%s); a human decides."
+                        % (dep_id, r["number"])); sys.exit(0)
+          within = float(e.get("WITHIN_MIN") or 0)
+          if within > 0:
+              if not dep:
+                  print("::notice::No deployment to %s found; runbooks not run." % e["DEPLOY_ENV"]); sys.exit(0)
+              age = (datetime.datetime.now(utc) - when(dep["created_at"])).total_seconds() / 60
+              if age > within:
+                  print("::notice::Last deployment %.0f min ago (> %s); runbooks not run." % (age, within)); sys.exit(0)
+          # 3. Record before acting; results are added as a comment afterwards.
+          subprocess.run(["gh", "label", "create", "sdlc-runbook", "--repo", repo, "--force"], capture_output=True)
+          subprocess.run(["gh", "label", "create", e["LABEL"], "--repo", repo, "--force"], capture_output=True)
+          body = ("<!-- %s deployment=%s -->\nAutomated runbook(s) %s for `%s` (breach point %s, deployment %s). Run: %s\n\n"
+                  "Review the action, then close this issue to re-arm automated runbooks for this metric."
+                  % (key, dep_id, ", ".join(names), metric, e["TS"], dep_id, e["RUN_URL"]))
+          url = gh("issue", "create", "--repo", repo, "--title", "[runbook] %s: %s" % (metric, ", ".join(names)),
+                   "--body", body, "--label", "sdlc-runbook,%s" % e["LABEL"]).strip()
+          failed, results = 0, []
+          for name in names:
+              cmd = runbooks.get(name)
+              if not cmd:
+                  print("::warning::runbook not pre-approved: %s (add it to .claude/sdlc.json runbooks via a reviewed PR)" % name)
+                  results.append("- %s: not pre-approved, skipped" % name)
+                  continue
+              print("::group::runbook %s: %s" % (name, cmd), flush=True)
+              try:
+                  rc = subprocess.run(cmd, shell=True, timeout=600).returncode
+              except subprocess.TimeoutExpired:
+                  rc = 124
+              print("::endgroup::")
+              print(json.dumps({"ts": datetime.datetime.now(utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                "runbook": name, "command": cmd, "exit": rc, "metric": metric}))
+              results.append("- %s: `%s` exit %d" % (name, cmd, rc))
+              failed |= rc != 0
+          subprocess.run(["gh", "issue", "comment", url, "--repo", repo, "--body", "\n".join(results)], timeout=60)
+          sys.exit(1 if failed else 0)
+          PY
