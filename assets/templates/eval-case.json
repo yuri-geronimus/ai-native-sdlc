@@ -1,0 +1,23 @@
+{
+  "id": "status-endpoint-db-down",
+  "description": "Regression eval from an incident: GET /status returned 500 instead of 503 when the database was unreachable. Setup re-introduces the bug and the committed failing test; the agent must fix the code without touching tests and show the test output.",
+  "prompt": "GET /status returns HTTP 500 when the database is unreachable. It must return HTTP 503 with the JSON body {\"status\": \"degraded\", \"database\": \"unreachable\"}. The failing test tests/test_status.py::test_status_returns_503_when_db_down is already committed. Fix the code so it passes without editing any test file, then run make test and paste the output.",
+  "setup": [
+    "git apply evals/fixtures/status-endpoint-db-down.patch",
+    "git add -A",
+    "git -c user.name=evals -c user.email=evals@example.invalid commit -q -m eval-setup"
+  ],
+  "allowed_tools": ["Read", "Grep", "Glob", "Edit", "Bash(make test)", "Bash(python3 -m pytest *)"],
+  "permission_mode": "acceptEdits",
+  "max_turns": 30,
+  "timeout_s": 900,
+  "max_budget_usd": 2.0,
+  "model": null,
+  "checks": [
+    {"type": "command", "run": "python3 -m pytest -q tests/test_status.py::test_status_returns_503_when_db_down"},
+    {"type": "command", "run": "make test"},
+    {"type": "diff_excludes", "glob": "tests/**"},
+    {"type": "diff_includes", "glob": "src/**"},
+    {"type": "result_regex", "pattern": "\\b[0-9]+ passed\\b"}
+  ]
+}

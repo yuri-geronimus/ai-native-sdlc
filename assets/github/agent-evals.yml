@@ -1,0 +1,188 @@
+# agent-evals.yml - continuous evals of the agent configuration (CLAUDE.md, skills, hooks).
+#
+# What it does
+#   Runs the repo's eval suite (evals/*.json, format in the skill's
+#   assets/templates/eval-case.json) with the skill's scripts/run_evals.py: each case runs
+#   real `claude -p` in a fresh git worktree of the PR (NOT --bare, because the point is
+#   to test CLAUDE.md, skills and hooks), then deterministic checks (commands, files,
+#   diff includes/excludes, result regex). Fails when the pass rate is below THRESHOLD or
+#   drops more than MAX_DROP against the last default-branch run (the baseline artifact).
+#   Results are uploaded as artifact "agent-evals-results" so runs can be compared.
+#
+# Playbook play
+#   Stage 4 "Continuous evals in CI": run non-interactively on a schedule and on any
+#   change to CLAUDE.md, skills or hooks; gate configuration changes on the result; every
+#   production incident adds a case.
+#
+# Required secrets
+#   ANTHROPIC_API_KEY with budget for eval runs. For Bedrock/Vertex/Foundry, replace it
+#   with the provider env (e.g. CLAUDE_CODE_USE_BEDROCK=1 plus
+#   aws-actions/configure-aws-credentials via OIDC; add id-token: write).
+#
+# How to adapt
+#   - Collect 20-50 real tasks with accepted outcomes as evals/<name>.json. Each case lists
+#     its own allowed_tools and permission_mode: project permissions.allow is ignored in an
+#     untrusted -p checkout, so nothing is pre-approved implicitly.
+#   - THRESHOLD / MAX_DROP / JOBS below; EVALS_DIR if your cases live elsewhere.
+#   - CLAUDE_CODE_VERSION: a pinned, tested version (>= 2.1.269) so a CLI upgrade does not
+#     move the baseline silently; bump it in a PR, which re-runs this suite.
+#   - Pin actions to a commit SHA if your policy requires it.
+#   - Required check caveat: a workflow skipped by a paths filter leaves a required check
+#     pending. Either do not make "evals" required, or require it via a ruleset that
+#     tolerates skips, or remove the paths filter.
+#   - Fork PRs get no secrets and are skipped.
+
+name: Agent evals
+
+on:
+  pull_request:
+    paths: ['CLAUDE.md', '**/CLAUDE.md', '.claude/**', 'evals/**', '.mcp.json', 'REVIEW.md']
+  push:
+    # Default-branch runs refresh the baseline the PR runs compare against (rename main if needed).
+    branches: [main]
+    paths: ['CLAUDE.md', '**/CLAUDE.md', '.claude/**', 'evals/**', '.mcp.json', 'REVIEW.md']
+  schedule:
+    # Nightly: catches model and provider changes that no PR touches.
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: agent-evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  evals:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read          # checkout; eval worktrees are local and discarded
+      actions: read           # find and download the baseline artifact of an earlier run
+    env:
+      SKILL_DIR: .claude/skills/ai-native-sdlc
+      EVALS_DIR: evals
+      THRESHOLD: "0.9"
+      MAX_DROP: "0.05"
+      JOBS: "2"
+      CLAUDE_CODE_VERSION: "2.1.294"   # tested; bump in a PR (needs >= 2.1.269)
+      # SKILL.md "Headless runs": eval prompts must not count as human presence.
+      # run_evals.py also sets it on every claude call, and caps each case with
+      # --max-turns and --max-budget-usd (case max_budget_usd, default 2.0).
+      SDLC_NONINTERACTIVE: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          # The eval agent has Bash; do not leave the token in .git/config.
+          persist-credentials: false
+
+      - name: Check for eval cases
+        id: cases
+        run: |
+          n=$(find "$EVALS_DIR" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          if [ "$n" -eq 0 ]; then
+            echo "::warning::No eval cases in $EVALS_DIR/*.json. Add cases (see $SKILL_DIR/assets/templates/eval-case.json)."
+          fi
+
+      - name: Install Claude Code
+        if: steps.cases.outputs.count != '0'
+        run: |
+          npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+          git config --global user.name "agent-evals"
+          git config --global user.email "agent-evals@users.noreply.github.com"
+
+      - name: Validate skills and agents frontmatter
+        if: steps.cases.outputs.count != '0'
+        # Deterministic; no model call (claude plugin validate, v2.1.233+; --strict verified
+        # on 2.1.294). Run it on the repo root, never on the skill folder itself (that fails
+        # with "No manifest found"): the root covers .claude/skills and .claude/agents, and
+        # --strict makes warnings (e.g. a missing description) fail the job. It is shallow:
+        # it catches YAML parse errors and missing metadata, not bad names or field values.
+        # It does not check hooks in .claude/settings.json.
+        run: claude plugin validate --strict .
+
+      - name: Fetch baseline from the default branch
+        if: steps.cases.outputs.count != '0' && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW: ${{ github.workflow }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Latest completed default-branch run that uploaded results (a failed run still
+          # uploads, so its results are a valid baseline).
+          for id in $(gh run list --workflow "$WORKFLOW" --branch "$DEFAULT_BRANCH" --status completed \
+                        --limit 10 --json databaseId --jq '.[].databaseId'); do
+            if gh run download "$id" --name agent-evals-results --dir baseline 2>/dev/null; then
+              echo "Baseline: run $id"; exit 0
+            fi
+          done
+          echo "::notice::No baseline found on $DEFAULT_BRANCH; gating on THRESHOLD only."
+
+      - name: Run eval suite
+        id: run
+        if: steps.cases.outputs.count != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          args=(--dir "$EVALS_DIR" --jobs "$JOBS" --threshold "$THRESHOLD" --out results.json)
+          if [ -f baseline/results.json ]; then
+            args+=(--compare baseline/results.json --max-drop "$MAX_DROP")
+          fi
+          python3 "$SKILL_DIR/scripts/run_evals.py" "${args[@]}"
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Summarize
+        if: always() && steps.cases.outputs.count != '0'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          def load(p):
+              try:
+                  with open(p, encoding="utf-8") as fh:
+                      return json.load(fh)
+              except (OSError, ValueError):
+                  return None
+          cur, base = load("results.json"), load("baseline/results.json")
+          print("## Agent evals")
+          if not cur:
+              print("No results.json (the run failed before writing results).")
+              raise SystemExit(0)
+          line = "Pass rate **%.1f%%** (%s/%s), cost $%.2f, threshold %s" % (
+              100 * cur.get("pass_rate", 0), cur.get("passed"), cur.get("total"),
+              cur.get("cost_usd") or 0, os.environ.get("THRESHOLD"))
+          if base:
+              line += ", baseline %.1f%%" % (100 * base.get("pass_rate", 0))
+          print(line + "\n")
+          print("| case | result | subtype | cost $ | failed checks |\n|---|---|---|---|---|")
+          for c in cur.get("cases", []):
+              bad = "; ".join("%s: %s" % (k.get("type"), k.get("detail", "")) for k in c.get("checks", []) if not k.get("passed"))
+              print("| %s | %s | %s | %.2f | %s |" % (c.get("id"), "pass" if c.get("passed") else "FAIL",
+                    c.get("subtype"), c.get("cost_usd") or 0, bad.replace("|", "/")[:200]))
+          PY
+
+      - name: Upload results
+        if: always() && steps.cases.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-evals-results
+          path: results.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Gate on pass rate
+        if: steps.cases.outputs.count != '0'
+        env:
+          EXIT: ${{ steps.run.outputs.exit }}
+        run: |
+          case "${EXIT:-}" in
+            0) exit 0 ;;
+            1) echo "::error::Eval pass rate below $THRESHOLD or dropped more than $MAX_DROP vs baseline (run_evals.py exit 1). The team that owns this configuration change reviews it before merge." ;;
+            2) echo "::error::run_evals.py configuration/environment error (exit 2): fix the eval case files or runner setup (see the Run eval suite log)." ;;
+            *) echo "::error::Eval runner failed (exit '${EXIT:-none}'); see the Run eval suite log." ;;
+          esac
+          exit 1

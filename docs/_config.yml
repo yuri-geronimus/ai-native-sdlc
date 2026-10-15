@@ -1,0 +1,9 @@
+title: ai-native-sdlc
+description: A Claude Code skill that implements the AI-native SDLC playbook - intent, spec, plan, build, verify, review and gated release, with human approval gates and a git audit trail.
+url: https://yuri-geronimus.github.io
+baseurl: /ai-native-sdlc
+theme: jekyll-theme-cayman
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-relative-links

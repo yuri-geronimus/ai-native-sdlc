@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this skill, please cite it as below."
+title: "ai-native-sdlc: a Claude Code skill implementing the AI-native SDLC playbook"
+abstract: >-
+  A Claude Code skill and plugin that runs software work through the AI-native
+  SDLC loop (intent.md, spec.md, plan.md, build, verify, PR review, gated release)
+  with human approval gates, guard hooks and a git-committed audit trail.
+  Alpha release, aimed at regulated teams (fintech, payments, medtech). Unofficial implementation of Anthropic's "The AI-native SDLC playbook".
+type: software
+authors:
+  - family-names: Geronimus
+    given-names: Yuri
+repository-code: "https://github.com/yuri-geronimus/ai-native-sdlc"
+url: "https://yuri-geronimus.github.io/ai-native-sdlc/"
+license: MIT
+version: 0.1.0-alpha.1
+date-released: 2026-10-15
+keywords:
+  - ai-native sdlc
+  - claude code
+  - agentic development
+  - ai code review
+  - human approval gates
+references:
+  - type: article
+    title: "The AI-native SDLC playbook"
+    url: "https://claude.com/resources/articles/the-ai-native-sdlc-playbook"
+    authors:
+      - name: Anthropic

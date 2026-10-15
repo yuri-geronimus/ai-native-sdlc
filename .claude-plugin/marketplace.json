@@ -1,0 +1,32 @@
+{
+  "name": "ai-native-sdlc",
+  "owner": {
+    "name": "Yuri Geronimus"
+  },
+  "metadata": {
+    "description": "[Alpha] Community implementation of Anthropic's AI-native SDLC playbook as a Claude Code plugin."
+  },
+  "plugins": [
+    {
+      "name": "ai-native-sdlc",
+      "source": {
+        "source": "github",
+        "repo": "yuri-geronimus/ai-native-sdlc",
+        "ref": "plugin"
+      },
+      "description": "[Alpha] AI-native SDLC loop for regulated teams (fintech, payments, medtech): intent, spec, plan, build, verify, review, gated release and monitoring, with human approval gates, guard hooks and sdlc-* subagents.",
+      "version": "0.1.0-alpha.1",
+      "author": {
+        "name": "Yuri Geronimus"
+      },
+      "license": "MIT",
+      "keywords": [
+        "sdlc",
+        "governance",
+        "claude-code",
+        "agents",
+        "audit-trail"
+      ]
+    }
+  ]
+}

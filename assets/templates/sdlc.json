@@ -1,0 +1,24 @@
+{
+  "changes_dir": "changes",
+  "default_branch": "main",
+  "source_of_truth": "repo",
+  "record_id_pattern": "",
+  "hooks_enabled": true,
+  "verify_commands": [],
+  "test_globs": ["tests/**", "test/**", "**/tests/**", "**/test_*.py", "**/*_test.py", "**/*_test.go", "**/*.test.*", "**/*.spec.*", "**/__tests__/**"],
+  "protected_paths": [],
+  "self_protect": true,
+  "plan_guard": true,
+  "plan_guard_exempt": [],
+  "verify_on_stop": true,
+  "review": {"mode": "off", "passes": ["Bugs", "Security", "Compliance"], "project_docs": false, "model": "", "timeout_s": 900},
+  "post_edit": [],
+  "production_gate": {
+    "bash_patterns": ["\\bdeploy\\b.*\\bprod(uction)?\\b", "\\bprod(uction)?\\b.*\\bdeploy\\b", "kubectl\\s+.*(apply|delete|rollout|scale|set|patch|replace|edit)\\b.*(-n|--namespace)[ =]?prod", "kubectl\\s+[^|;&]*(-n|--namespace)[ =]?prod[^|;&]*\\b(apply|delete|rollout|scale|set|patch|replace|edit)\\b", "kubectl\\b[^|;&]*--(context|cluster)[ =]\\S*prod[^|;&]*\\b(apply|delete|rollout|scale|set|patch|replace|edit)\\b", "kubectl\\b[^|;&]*\\b(apply|delete|rollout|scale|set|patch|replace|edit)\\b[^|;&]*--(context|cluster)[ =]\\S*prod", "\\bhelm\\s+(upgrade|install|rollback|uninstall)\\b.*\\bprod", "\\bhelm\\b[^|;&]*--kube-context[ =]\\S*prod[^|;&]*\\b(upgrade|install|rollback|uninstall)\\b", "\\bterraform\\b(\\s+-\\S+)*\\s+(apply|destroy)\\b", "\\bgh\\s+workflow\\s+run\\b.*\\b(deploy|release)\\b.*\\bprod", "\\bgit\\s+push\\s+(-\\S+\\s+)*prod(uction)?\\b"],
+    "mcp_tools": ["mcp__.*__deploy_prod.*", "mcp__.*__.*production.*"],
+    "approval_check": "",
+    "approval_timeout_s": 20
+  },
+  "runbooks": {},
+  "evals_dir": "evals"
+}

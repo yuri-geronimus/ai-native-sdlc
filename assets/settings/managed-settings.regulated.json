@@ -1,0 +1,81 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(.env*)",
+      "Read(./secrets/**)",
+      "WebFetch",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(terraform apply *)",
+      "Bash(terraform destroy *)",
+      "Edit(**/.claude/sdlc-state/**)",
+      "Edit(**/changes/*/audit.md)"
+    ],
+    "allow": [
+      "Bash(git *)",
+      "Bash(make build)",
+      "Bash(make test)",
+      "Bash(make lint)",
+      "Bash(python3 *ai-native-sdlc/scripts/sdlc.py*)",
+      "Bash(python3 *ai-native-sdlc/scripts/bands.py*)",
+      "Bash(python3 *ai-native-sdlc/scripts/run_evals.py*)"
+    ],
+    "ask": [
+      "Bash(python3 *sdlc.py* approve*)",
+      "Bash(python3 *sdlc.py* reject*)",
+      "Bash(python3 *sdlc.py* fix-mode*)",
+      "Bash(python3 *sdlc.py* raise-tier*)",
+      "Bash(python3 *sdlc.py* skip*)",
+      "Bash(python3 *sdlc.py* plan-from-accepted*)",
+      "Bash(python3 *sdlc.py* init*)"
+    ],
+    "disableBypassPermissionsMode": "disable",
+    "disableAutoMode": "disable"
+  },
+  "allowManagedPermissionRulesOnly": true,
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "network": {
+      "allowedDomains": ["git.internal.example.com", "registry.npmjs.org"]
+    },
+    "credentials": {
+      "files": [
+        { "path": "~/.ssh", "mode": "deny" },
+        { "path": "~/.aws/credentials", "mode": "deny" }
+      ],
+      "envVars": [
+        { "name": "GITHUB_TOKEN", "mode": "deny" }
+      ]
+    }
+  },
+  "allowManagedHooksOnly": true,
+  "disableSideloadFlags": true,
+  "allowManagedMcpServersOnly": true,
+  "allowedMcpServers": [
+    { "serverUrl": "https://api.githubcopilot.com/mcp/*" }
+  ],
+  "strictKnownMarketplaces": [
+    { "source": "github", "repo": "example-corp/approved-plugins" }
+  ],
+  "extraKnownMarketplaces": {
+    "approved-plugins": {
+      "source": { "source": "github", "repo": "example-corp/approved-plugins" }
+    }
+  },
+  "enabledPlugins": {
+    "ai-native-sdlc@approved-plugins": true
+  },
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_METRICS_EXPORTER": "otlp",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otel.internal.example.com"
+  },
+  "requiredMinimumVersion": "2.1.282"
+}

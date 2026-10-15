@@ -1,0 +1,19 @@
+# Labels to create in Settings > Labels (or `gh label create <name> --color <hex> --description <text>`).
+- name: good first issue
+  color: "7057ff"
+  description: Small, well-scoped, good for a first contribution
+- name: help wanted
+  color: "008672"
+  description: Maintainer would welcome a PR
+- name: docs
+  color: "0075ca"
+  description: Documentation only
+- name: hooks
+  color: "d93f0b"
+  description: Guard hooks and settings
+- name: ci
+  color: "fbca04"
+  description: GitHub workflows and evals
+- name: question
+  color: "d876e3"
+  description: Usage question; prefer Discussions

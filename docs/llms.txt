@@ -1,0 +1,14 @@
+# ai-native-sdlc
+
+> Alpha release, aimed at regulated teams (fintech, payments, medtech). Open-source Claude Code skill and plugin implementing Anthropic's "The AI-native SDLC playbook": intent, spec, plan, build, verify, PR review and gated release, with human approval gates, guard hooks and a git audit trail. Unofficial; not affiliated with Anthropic.
+
+## Docs
+- [How it works](https://yuri-geronimus.github.io/ai-native-sdlc/how-it-works): stages, gates, tiers, folder layout
+- [Guide](https://yuri-geronimus.github.io/ai-native-sdlc/guide): setup and daily use
+- [FAQ](https://yuri-geronimus.github.io/ai-native-sdlc/faq): common questions
+- [Configuration](https://yuri-geronimus.github.io/ai-native-sdlc/configuration): sdlc.json reference
+- [Design decisions](https://yuri-geronimus.github.io/ai-native-sdlc/design-decisions): choices and known limits
+
+## Source
+- [Repository](https://github.com/yuri-geronimus/ai-native-sdlc)
+- [Original playbook](https://claude.com/resources/articles/the-ai-native-sdlc-playbook)

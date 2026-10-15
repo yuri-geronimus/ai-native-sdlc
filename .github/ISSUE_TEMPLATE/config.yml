@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/yuri-geronimus/ai-native-sdlc/discussions
+    about: Ask how to set the skill up, or share how you use it, in Discussions.

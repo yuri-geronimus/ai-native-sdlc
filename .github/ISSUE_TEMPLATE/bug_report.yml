@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in the skill, scripts or hooks doesn't work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Include literal output or error text.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The command or prompt you ran, starting from a clean repo if possible.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Claude Code, Python, OS
+      placeholder: "Claude Code 2.x, Python 3.12, macOS 15"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: .claude/sdlc.json
+      description: Paste it, with anything private removed.
+      render: json
